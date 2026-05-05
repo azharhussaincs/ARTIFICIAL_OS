@@ -1,0 +1,44 @@
+services:
+  api:
+    build: ./backend
+    container_name: osint-api
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - osint-data:/app/data
+    depends_on:
+      - db
+
+  web:
+    build: ./frontend
+    container_name: osint-web
+    restart: unless-stopped
+    environment:
+      # When the web service runs in the same compose network, /api/* is
+      # proxied to the api container by name. Browsers reach the web
+      # container on :3000.
+      NEXT_PUBLIC_API_BASE: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  db:
+    image: postgres:16-alpine
+    container_name: osint-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: osint
+      POSTGRES_PASSWORD: osint
+      POSTGRES_DB: osint
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  osint-data:
+  pg-data:

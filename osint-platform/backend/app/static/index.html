@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OSINT Platform — Cross-Identity Intelligence</title>
+  <meta name="description" content="Ethical OSINT dashboard: enter one identifier, discover and verify connected public identities." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Inter:wght@300;400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/assets/style.css" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'><stop offset='0' stop-color='%2322d3ee'/><stop offset='1' stop-color='%23a78bfa'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='%23050709'/><circle cx='32' cy='32' r='18' fill='none' stroke='url(%23g)' stroke-width='4'/><circle cx='32' cy='32' r='4' fill='url(%23g)'/></svg>" />
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink:      "#05070b",
+            panel:    "#0b0f17",
+            panel2:   "#111826",
+            line:     "#1f2a3a",
+            accent:   "#22d3ee",
+            accent2:  "#a78bfa",
+            danger:   "#f43f5e",
+            ok:       "#34d399",
+          },
+          fontFamily: {
+            mono: ['"JetBrains Mono"', "monospace"],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="bg-ink text-slate-200 font-sans min-h-screen">
+  <div class="fixed inset-0 -z-10 opacity-20 pointer-events-none bg-grid"></div>
+  <div class="fixed inset-0 -z-10 pointer-events-none bg-radial-glow"></div>
+
+  <header class="border-b border-line/60 backdrop-blur-md bg-ink/70 sticky top-0 z-30">
+    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-accent to-accent2 flex items-center justify-center font-mono font-extrabold text-ink shadow-lg shadow-accent/20">O</div>
+        <div>
+          <div class="font-mono font-bold tracking-wide text-slate-100">OSINT://platform</div>
+          <div class="text-xs text-slate-500">cross-identity intelligence</div>
+        </div>
+      </div>
+      <nav class="flex items-center gap-6 text-sm text-slate-400">
+        <a href="#search" class="hover:text-accent transition">Search</a>
+        <a href="#findings" class="hover:text-accent transition">Findings</a>
+        <a href="#dashboard" class="hover:text-accent transition">Graph</a>
+        <a href="#history" class="hover:text-accent transition">History</a>
+        <a href="/docs" target="_blank" class="hover:text-accent transition">API</a>
+        <span id="status-pill" class="hidden md:inline-flex items-center gap-2 px-3 py-1 rounded-full border border-line text-xs font-mono">
+          <span class="w-2 h-2 rounded-full bg-ok animate-pulse"></span><span id="status-text">ready</span>
+        </span>
+      </nav>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-6 py-10 space-y-10">
+
+    <!-- Hero / Search -->
+    <section id="search" class="space-y-6">
+      <div class="space-y-2">
+        <div class="text-xs font-mono uppercase tracking-[0.3em] text-accent/80">// cross-identity correlation</div>
+        <h1 class="text-3xl md:text-4xl font-bold tracking-tight">
+          One identifier in. <span class="text-accent">Verified connected identities</span> out.
+        </h1>
+        <p class="text-slate-400 max-w-2xl text-sm md:text-base">
+          The engine probes public profile sites, fetches confirmed profiles, extracts inline emails / handles / links from their bios, re-probes newly discovered handles, looks up public RDAP records for any domain, and merges every source into one <code class="text-accent2">Finding</code> per identity — each scored, with reasons.
+        </p>
+      </div>
+
+      <form id="search-form" class="bg-panel border border-line rounded-2xl p-5 md:p-6 shadow-2xl shadow-black/40">
+        <div class="flex flex-wrap gap-2 mb-4" id="kind-tabs">
+          <button type="button" data-kind="name"     class="kind-tab tab-active">👤 Name</button>
+          <button type="button" data-kind="email"    class="kind-tab">📧 Email</button>
+          <button type="button" data-kind="phone"    class="kind-tab">📞 Phone</button>
+          <button type="button" data-kind="username" class="kind-tab">🔖 Username</button>
+        </div>
+        <div class="flex flex-col md:flex-row gap-3">
+          <input id="query-input"
+            class="flex-1 bg-ink border border-line focus:border-accent rounded-lg px-4 py-3 font-mono text-sm placeholder:text-slate-600 outline-none transition"
+            placeholder="e.g. Jane Doe" autocomplete="off" />
+          <button id="run-btn" class="px-6 py-3 rounded-lg bg-gradient-to-r from-accent to-accent2 text-ink font-bold tracking-wide hover:brightness-110 transition flex items-center gap-2">
+            <span id="run-label">Run search</span>
+            <svg id="run-spinner" class="hidden w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" opacity="0.3"/>
+              <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="flex flex-wrap items-center justify-between mt-4 text-xs text-slate-500 gap-3">
+          <div>🛡️ Public sources only · respects robots.txt · no login bypass</div>
+          <div class="flex gap-4">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input id="live-stream" type="checkbox" class="accent-accent" checked />
+              <span>Live stream (SSE)</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input id="dorks-only" type="checkbox" class="accent-accent" />
+              <span>Dorks only (no crawl)</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer" title="When the local Elasticsearch index returns a match, skip the external OSINT pipeline entirely and treat the DB record as final.">
+              <input id="short-circuit" type="checkbox" class="accent-ok" />
+              <span>Skip OSINT on DB hit</span>
+            </label>
+          </div>
+        </div>
+      </form>
+
+      <div id="scan-log" class="hidden bg-panel/70 border border-line rounded-xl p-4 font-mono text-xs text-slate-400 max-h-48 overflow-y-auto"></div>
+    </section>
+
+    <!-- Dashboard -->
+    <section id="dashboard" class="space-y-6 hidden">
+      <div class="grid grid-cols-2 md:grid-cols-6 gap-3">
+        <div class="metric"><div class="metric-label">Confidence</div><div id="m-conf" class="metric-value text-accent">—</div></div>
+        <div class="metric"><div class="metric-label">Verified</div><div id="m-verified" class="metric-value text-ok">—</div></div>
+        <div class="metric"><div class="metric-label">Findings</div><div id="m-findings" class="metric-value">—</div></div>
+        <div class="metric"><div class="metric-label">Usernames</div><div id="m-users" class="metric-value">—</div></div>
+        <div class="metric"><div class="metric-label">Emails</div><div id="m-emails" class="metric-value">—</div></div>
+        <div class="metric"><div class="metric-label">Profiles</div><div id="m-profiles" class="metric-value">—</div></div>
+      </div>
+
+      <!-- 🟢 LOCAL DATABASE (HIGH TRUST) — Elasticsearch tc_index -->
+      <div class="card border-l-4 border-l-ok/70" id="es-section">
+        <div class="card-header">
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-ok">🟢 VERIFIED LOCAL DATABASE (100% TRUST)</span>
+            <span id="es-status-pill" class="text-xs font-mono px-2 py-0.5 rounded-full border border-line text-slate-500">idle</span>
+          </div>
+          <div id="es-meta" class="text-xs text-slate-500 font-mono"></div>
+        </div>
+        <div id="es-results" class="card-body space-y-2 max-h-[480px] overflow-y-auto"></div>
+      </div>
+
+      <!-- 🌐 OSINT FINDINGS (UNVERIFIED) — wrapper banner + stats -->
+      <div class="card border-l-4 border-l-amber-500/60" id="osint-banner">
+        <div class="card-header">
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-amber-300">🌐 OSINT FINDINGS (UNVERIFIED)</span>
+          </div>
+          <div id="osint-banner-meta" class="text-xs text-slate-500 font-mono"></div>
+        </div>
+        <div id="osint-stats-body" class="card-body text-sm"></div>
+      </div>
+
+      <!-- === SUMMARY === — comparison only (never merged) -->
+      <div class="card" id="final-summary-card">
+        <div class="card-header"><div>=== SUMMARY ===</div></div>
+        <div id="final-summary-body" class="card-body space-y-2"></div>
+      </div>
+
+      <!-- Findings panel -->
+      <div id="findings" class="card">
+        <div class="card-header">
+          <div>Verified Findings</div>
+          <div class="flex items-center gap-2">
+            <select id="filter-type" class="filter-select">
+              <option value="">all types</option>
+              <option value="username">username</option>
+              <option value="email">email</option>
+              <option value="phone">phone</option>
+              <option value="name">name</option>
+              <option value="social_profile">social_profile</option>
+              <option value="website">website</option>
+              <option value="domain">domain</option>
+            </select>
+            <select id="filter-conf" class="filter-select">
+              <option value="50" selected>≥ 50 (possible+)</option>
+              <option value="0">any confidence</option>
+              <option value="70">≥ 70 (likely+)</option>
+              <option value="90">≥ 90 (high only)</option>
+            </select>
+            <label class="flex items-center gap-1 text-xs text-slate-400 cursor-pointer">
+              <input id="filter-verified" type="checkbox" class="accent-accent" />
+              verified only
+            </label>
+            <label class="flex items-center gap-1 text-xs text-slate-400 cursor-pointer">
+              <input id="show-signals" type="checkbox" class="accent-accent" checked />
+              signal trail
+            </label>
+            <button id="btn-export-csv" class="btn-ghost">CSV</button>
+            <button id="btn-export-pdf" class="btn-ghost">PDF</button>
+          </div>
+        </div>
+        <div id="findings-list" class="card-body grid grid-cols-1 md:grid-cols-2 gap-3"></div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="lg:col-span-1 space-y-4">
+          <div class="card">
+            <div class="card-header"><div>Identity Summary</div></div>
+            <div id="identity-summary" class="card-body text-sm space-y-2"></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><div>Timeline</div></div>
+            <div id="timeline" class="card-body text-xs font-mono space-y-1 max-h-72 overflow-y-auto"></div>
+          </div>
+        </div>
+
+        <div class="lg:col-span-2 card">
+          <div class="card-header">
+            <div>Identity Graph</div>
+            <div class="text-xs text-slate-500 font-mono">drag · scroll to zoom · hover for details</div>
+          </div>
+          <div id="graph" class="h-[480px] bg-ink/60 rounded-b-xl"></div>
+        </div>
+      </div>
+
+      <!-- Snapshots -->
+      <div class="card">
+        <div class="card-header"><div>Profile Snapshots</div></div>
+        <div id="snapshots-list" class="card-body grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Dorks -->
+        <div class="card">
+          <div class="card-header"><div>Search Dorks</div></div>
+          <div id="dorks-list" class="card-body space-y-2 max-h-[480px] overflow-y-auto"></div>
+        </div>
+        <!-- WHOIS -->
+        <div class="card">
+          <div class="card-header"><div>RDAP / WHOIS</div></div>
+          <div id="whois-list" class="card-body space-y-2 max-h-[480px] overflow-y-auto"></div>
+        </div>
+      </div>
+
+      <!-- Plain-text report -->
+      <div class="card">
+        <div class="card-header">
+          <div>Text Report</div>
+          <button id="copy-report-btn" class="btn-ghost" disabled>copy</button>
+        </div>
+        <pre id="text-report-body" class="card-body font-mono text-xs whitespace-pre-wrap text-slate-300 max-h-[420px] overflow-y-auto m-0"></pre>
+      </div>
+    </section>
+
+    <!-- History -->
+    <section id="history" class="space-y-3">
+      <div class="flex items-center justify-between">
+        <div class="font-mono text-slate-300">// recent searches</div>
+        <button id="refresh-history" class="btn-ghost">refresh</button>
+      </div>
+      <div id="history-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+    </section>
+
+  </main>
+
+  <footer class="border-t border-line/60 mt-10 px-6 py-6 text-xs text-slate-500 flex flex-wrap justify-between gap-2 max-w-7xl mx-auto">
+    <div>© OSINT Platform — for ethical, lawful intelligence work only.</div>
+    <div class="font-mono">v1.2.0 · <a href="/docs" class="text-accent hover:underline">/docs</a></div>
+  </footer>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
