@@ -264,6 +264,14 @@
     $("#btn-export-pdf").onclick = () => { if (p.id) window.open(`/api/export/${p.id}/pdf`, "_blank"); };
     $("#btn-export-csv").disabled = !p.id;
     $("#btn-export-pdf").disabled = !p.id;
+    // "Download Report" — works whether or not the search has been persisted.
+    // If we have a DB id, hand off to the server PDF endpoint (best fidelity).
+    // Otherwise build a self-contained text report from the in-memory result.
+    const dlBtn = $("#btn-download-report");
+    if (dlBtn) {
+      dlBtn.disabled = false;
+      dlBtn.onclick = () => downloadReport(p);
+    }
 
     document.getElementById("dashboard").scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -723,6 +731,137 @@ Confidence Score: <span class="text-accent font-bold">${score}/100</span></pre>
       });
       el.appendChild(a);
     }
+  }
+
+  // --- Download Report -----------------------------------------------------
+  // Single entry point for the "Download Report" button. Tries server-side PDF
+  // first (best fidelity: backend renders the same plain-text report you see
+  // in the dashboard, plus PDF formatting). If the search hasn't been persisted
+  // to the DB yet (no `id`), falls back to a client-side .txt build so the
+  // download still works in every state — including dorks-only / SSE flows.
+  function downloadReport(p) {
+    if (!p) return;
+    if (p.id) {
+      // Server-side PDF — proven path, identical content to the existing PDF
+      // export button. Opens in a new tab so the browser handles the download.
+      window.open(`/api/export/${p.id}/pdf`, "_blank");
+      return;
+    }
+    // Client-side text report — assembled from the in-memory result.
+    const text = buildClientReport(p);
+    const safe = (s) => String(s || "").replace(/[^a-z0-9._-]+/gi, "_").slice(0, 60);
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const fname = `osint-report-${safe(p.query_kind)}-${safe(p.query_value)}-${ts}.txt`;
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  // Compose a readable text report from the current result. Prefers the
+  // backend-rendered `text_report` (same one the dashboard's Text Report card
+  // displays); appends a "Findings" appendix so the file isn't ever empty.
+  function buildClientReport(p) {
+    const lines = [];
+    const bar = "=".repeat(60);
+    lines.push(bar);
+    lines.push("OSINT PLATFORM — SEARCH REPORT");
+    lines.push(bar);
+    lines.push(`Query:      ${p.query_kind || "—"} = ${p.query_value || "—"}`);
+    lines.push(`Started:    ${p.started_at || "—"}`);
+    lines.push(`Finished:   ${p.finished_at || "—"}`);
+    lines.push(`Generated:  ${new Date().toISOString()}`);
+    if (typeof p.confidence_score === "number") {
+      lines.push(`Confidence: ${p.confidence_score}/100 (${p.confidence_label || "—"})`);
+    }
+    lines.push("");
+
+    // Use the backend's pre-rendered report verbatim when available — keeps
+    // the dual-section layout (Local DB + OSINT Findings) consistent with the
+    // dashboard's Text Report card.
+    if (p.text_report && typeof p.text_report === "string" && p.text_report.trim()) {
+      lines.push(p.text_report.trim());
+      lines.push("");
+    }
+
+    // Always append a structured Findings appendix so the report is complete
+    // even when the engine couldn't produce a text_report (e.g. dorks-only).
+    const findings = Array.isArray(p.findings) ? p.findings : [];
+    if (findings.length) {
+      lines.push(bar);
+      lines.push(`FINDINGS APPENDIX (${findings.length})`);
+      lines.push(bar);
+      findings
+        .slice()
+        .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+        .forEach((f, i) => {
+          const verified = f.verified ? " ✓ VERIFIED" : "";
+          lines.push(`[${i + 1}] ${f.type || "?"}: ${f.value || ""}${verified}`);
+          lines.push(`    confidence: ${f.confidence ?? 0} (${f.label || "—"})`);
+          (f.match_reasons || []).slice(0, 6).forEach(r => lines.push(`    - ${r}`));
+          (f.sources || []).slice(0, 4).forEach(s => {
+            const url = (s && s.url && !String(s.url).startsWith("urn:")) ? s.url : "(internal)";
+            lines.push(`    src: ${s.source_type || "?"}  ${url}`);
+          });
+          lines.push("");
+        });
+    }
+
+    // Local DB matches — short tabular block (the human-readable section the
+    // user sees in the green DB panel).
+    const ldb = p.local_db || p.local_database || null;
+    const dbRecs = ldb && Array.isArray(ldb.records) ? ldb.records : [];
+    if (dbRecs.length) {
+      lines.push(bar);
+      lines.push(`VERIFIED LOCAL DATABASE (${dbRecs.length})`);
+      lines.push(bar);
+      dbRecs.forEach((r, i) => {
+        const tags = Array.isArray(r.TAGS) ? r.TAGS.join(", ") : (r.TAGS || "");
+        const date = (r.ASONDATE || "").split(" ")[0];
+        lines.push(`Record ${i + 1}`);
+        lines.push(`  Name:   ${r.NAME || "—"}`);
+        lines.push(`  Phone:  ${r.PHONE || "—"}`);
+        lines.push(`  Email:  ${r.EMAIL || "—"}`);
+        if (tags) lines.push(`  Tags:   ${tags}`);
+        if (date) lines.push(`  Date:   ${date}`);
+        if (r.matched_field) lines.push(`  Match:  ${r.matched_field} (${r.match_reason || ""})`);
+        lines.push("");
+      });
+    }
+
+    // Related identifiers — flat lists for quick reference.
+    const sectionList = (label, arr) => {
+      if (Array.isArray(arr) && arr.length) {
+        lines.push(`${label} (${arr.length}):`);
+        arr.slice(0, 50).forEach(v => lines.push(`  - ${v}`));
+        lines.push("");
+      }
+    };
+    lines.push(bar);
+    lines.push("RELATED IDENTIFIERS");
+    lines.push(bar);
+    sectionList("Usernames", p.related_usernames);
+    sectionList("Emails",    p.related_emails);
+    sectionList("Phones",    p.related_phones);
+    sectionList("Websites",  p.related_websites);
+    sectionList("Domains",   p.related_domains);
+
+    if (Array.isArray(p.social_profiles) && p.social_profiles.length) {
+      lines.push(`Social profiles (${p.social_profiles.length}):`);
+      p.social_profiles.slice(0, 60).forEach(sp =>
+        lines.push(`  - ${sp.platform || "?"} / ${sp.handle || ""}  ${sp.url || ""}`));
+      lines.push("");
+    }
+
+    lines.push(bar);
+    lines.push("End of report — for ethical, lawful intelligence work only.");
+    lines.push(bar);
+    return lines.join("\n");
   }
 
   // --- helpers ---
