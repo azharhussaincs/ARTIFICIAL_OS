@@ -1,4 +1,4 @@
-# OSINT Platform
+ claude# OSINT Platform
 
 A modular, ethical Open-Source Intelligence (OSINT) web application.
 Enter a **name**, **email**, **phone**, or **username** and the platform

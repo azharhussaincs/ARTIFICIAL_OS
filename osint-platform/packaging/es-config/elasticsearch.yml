@@ -1,0 +1,42 @@
+# OSINT Platform — embedded Elasticsearch configuration
+# Single-node, localhost-only, security disabled.
+# path.data / path.logs / path.repo / http.port are injected at runtime by
+# launcher.py (-E flags) so the same config works in installed and portable
+# modes without rewriting yml files at install time.
+
+cluster.name: osint-local
+node.name: osint-node
+
+network.host: 127.0.0.1
+http.host: 127.0.0.1
+transport.host: 127.0.0.1
+
+# Single-node mode: skip the bootstrap-checks gauntlet, no master election.
+discovery.type: single-node
+
+# Security: disabled. The cluster is bound to 127.0.0.1 and is only reachable
+# from the same machine that started the launcher. Adding TLS/auth would
+# only add startup friction for a desktop user with no security benefit.
+xpack.security.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+xpack.security.enrollment.enabled: false
+
+# Heavy features disabled to cut startup time and RAM.
+xpack.ml.enabled: false
+xpack.watcher.enabled: false
+xpack.monitoring.collection.enabled: false
+ingest.geoip.downloader.enabled: false
+
+# Telemetry off — fully offline product.
+telemetry.tracing.enabled: false
+
+# Don't try to mlock; desktop machines can't always grant the privilege.
+bootstrap.memory_lock: false
+
+# Allow large boolean queries (matches the OSINT pipeline patterns).
+indices.query.bool.max_clause_count: 4096
+
+# Refuse wildcard deletes (defence in depth — the UI should never trigger
+# this, but a stray script must not be able to nuke the index).
+action.destructive_requires_name: true

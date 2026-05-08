@@ -1,0 +1,15 @@
+# PyInstaller / build outputs
+build/
+dist/
+.buildvenv/
+*.spec.bak
+
+# Vendored binaries (Elasticsearch zip extraction + snapshot tarball)
+# These are huge and machine-specific; never commit them.
+vendor/
+
+# Inno Setup output
+installer/Output/
+
+# Build logs / crash dumps
+*.log

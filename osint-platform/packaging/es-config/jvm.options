@@ -1,0 +1,29 @@
+## OSINT Platform — Elasticsearch JVM tuning
+##
+## Heap size (-Xms/-Xmx) is set dynamically at launch time by launcher.py
+## via the ES_JAVA_OPTS env var; do NOT set it here.
+
+## Garbage collector — G1 is the ES 8.x default and is right for desktop.
+-XX:+UseG1GC
+
+## Pre-touch heap pages on start so first queries don't pay page-fault tax.
+-XX:+AlwaysPreTouch
+
+## Disable explicit GC calls from libraries.
+-XX:+DisableExplicitGC
+
+## Reasonable defaults for a single-user desktop instance.
+-Xss1m
+-Djava.awt.headless=true
+-Dfile.encoding=UTF-8
+-Djna.nosys=true
+
+## Errors / heap dumps land in the user's logs dir (path injected at runtime).
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:+ExitOnOutOfMemoryError
+
+## Network stack — IPv4 first, ES has historical IPv6 quirks.
+-Djava.net.preferIPv4Stack=true
+
+## Required JDK module opens for ES 8.x on bundled JDK 21.
+17-:-Djava.security.manager=allow

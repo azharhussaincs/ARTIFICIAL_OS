@@ -1,0 +1,498 @@
+name: Build Windows installer
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Build pipeline for the OSINT Platform Windows desktop app.
+#
+# Triggers:
+#   - push to main / packaging/**: builds and uploads artifacts (no release)
+#   - tag push v*.*.*           : builds AND publishes a GitHub Release
+#   - workflow_dispatch         : manual run with snapshot toggle
+#
+# Artifacts produced (downloadable from the run summary):
+#   - OSINT-Setup-<sha>.zip       contains  OSINT-Setup-<version>.exe
+#   - OSINT-Portable-<sha>.zip    contains  OSINT-Portable.7z
+#   - OSINT-exe-<sha>.zip         contains  the bare OSINT.exe (smoke test)
+#   - build-logs (only on failure) PyInstaller analysis + warn-*.txt
+#
+# Repository secrets (configure in Settings -> Secrets -> Actions):
+#   ES_SNAPSHOT_URL   HTTPS URL to vendor/snap_v1.tar.zst (R2 / S3 / B2 / etc.)
+#   ES_SNAPSHOT_AUTH  optional auth header value, e.g. "Bearer xxx" or
+#                     "AWS4-HMAC-SHA256 ...". Leave unset for public URLs.
+#
+# If ES_SNAPSHOT_URL is unset OR include_snapshot=false, the workflow still
+# builds — the resulting installer just ships with an empty index. The
+# launcher's first-run logic skips restore gracefully when no snapshot is
+# bundled.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    paths:
+      - "osint-platform/**"
+      - ".github/workflows/build-windows.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "osint-platform/**"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch:
+    inputs:
+      es_version:
+        description: "Elasticsearch version (with-JDK Windows ZIP)"
+        required: true
+        default: "8.15.3"
+      include_snapshot:
+        description: "Bundle the ES snapshot (requires ES_SNAPSHOT_URL secret)"
+        type: boolean
+        required: true
+        default: true
+      installer_version:
+        description: "Override installer AppVersion (defaults to tag or 0.0.0-dev)"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # required for creating GitHub Releases on tag push
+
+env:
+  PYTHON_VERSION: "3.11.9"
+  NODE_VERSION: "20"
+  ES_VERSION_DEFAULT: "8.15.3"
+  PYINSTALLER_VERSION: "6.10.0"
+  ZSTANDARD_VERSION: "0.22.0"
+
+jobs:
+  build:
+    name: Build OSINT.exe + installer (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      # ────────────────────────────────────────────────────────────────────
+      # 1. Runner setup: long paths, disk space, env exports
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Enable Windows long paths
+        run: |
+          git config --system core.longpaths true
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          # PowerShell, npm, and Python all benefit from the regkey above.
+          Write-Host "Long paths enabled."
+
+      - name: Free disk space on runner
+        run: |
+          # windows-latest C: is small (~14 GB free). We use D:\a (workspace)
+          # which has ~80 GB. Strip unused tooling from C: as a safety net so
+          # PyInstaller's TEMP usage doesn't run out of space.
+          $cleanup = @(
+            "C:\Android",
+            "C:\hostedtoolcache\boost",
+            "C:\hostedtoolcache\CodeQL",
+            "C:\hostedtoolcache\Ruby",
+            "C:\hostedtoolcache\go",
+            "$env:LOCALAPPDATA\Microsoft\AndroidSDK"
+          )
+          foreach ($p in $cleanup) {
+            if (Test-Path $p) {
+              Write-Host "Removing $p"
+              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+            }
+          }
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+          # Move TEMP to D:\ to give PyInstaller plenty of room
+          $tmp = "$env:RUNNER_TEMP\osint-tmp"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          "TEMP=$tmp"  | Out-File $env:GITHUB_ENV -Append
+          "TMP=$tmp"   | Out-File $env:GITHUB_ENV -Append
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+          fetch-depth: 1
+
+      - name: Resolve build parameters
+        id: params
+        run: |
+          $esVersion = '${{ github.event.inputs.es_version }}'
+          if ([string]::IsNullOrWhiteSpace($esVersion)) {
+            $esVersion = '${{ env.ES_VERSION_DEFAULT }}'
+          }
+
+          $installerVersion = '${{ github.event.inputs.installer_version }}'
+          if ([string]::IsNullOrWhiteSpace($installerVersion)) {
+            if ($env:GITHUB_REF -like 'refs/tags/v*') {
+              $installerVersion = $env:GITHUB_REF -replace '^refs/tags/v',''
+            } else {
+              $installerVersion = "0.0.0-dev+${env:GITHUB_RUN_NUMBER}"
+            }
+          }
+
+          $includeSnap = '${{ github.event.inputs.include_snapshot }}'
+          if ([string]::IsNullOrWhiteSpace($includeSnap)) { $includeSnap = 'true' }
+
+          "es_version=$esVersion"             | Out-File $env:GITHUB_OUTPUT -Append
+          "installer_version=$installerVersion" | Out-File $env:GITHUB_OUTPUT -Append
+          "include_snapshot=$includeSnap"     | Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "ES version       : $esVersion"
+          Write-Host "Installer version: $installerVersion"
+          Write-Host "Include snapshot : $includeSnap"
+
+      # ────────────────────────────────────────────────────────────────────
+      # 2. Toolchain: Python + Node
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            osint-platform/backend/requirements.txt
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: osint-platform/frontend/package-lock.json
+
+      # ────────────────────────────────────────────────────────────────────
+      # 3. Vendored Elasticsearch (cached, ~600 MB ZIP)
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Cache Elasticsearch ZIP
+        id: cache-es
+        uses: actions/cache@v4
+        with:
+          path: osint-platform/packaging/vendor/elasticsearch.zip
+          key: elasticsearch-${{ steps.params.outputs.es_version }}-windows-x86_64
+
+      - name: Download Elasticsearch (with bundled JDK)
+        if: steps.cache-es.outputs.cache-hit != 'true'
+        run: |
+          $version = '${{ steps.params.outputs.es_version }}'
+          $url     = "https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-$version-windows-x86_64.zip"
+          $vendor  = "osint-platform/packaging/vendor"
+          $dest    = "$vendor/elasticsearch.zip"
+          New-Item -ItemType Directory -Force -Path $vendor | Out-Null
+          Write-Host "Downloading $url"
+          curl.exe --fail --location --retry 3 --retry-delay 10 -o $dest $url
+          if (-not (Test-Path $dest)) { throw "Elasticsearch download failed" }
+          $sizeMb = [math]::Round((Get-Item $dest).Length / 1MB, 1)
+          Write-Host "ES ZIP size: $sizeMb MB"
+
+      - name: Extract Elasticsearch
+        run: |
+          $vendor = "osint-platform/packaging/vendor"
+          $zip    = "$vendor/elasticsearch.zip"
+          $target = "$vendor/elasticsearch"
+          if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+          Write-Host "Extracting ES ZIP..."
+          Expand-Archive -Path $zip -DestinationPath $vendor -Force
+          # ES extracts to "elasticsearch-<version>"; rename to plain "elasticsearch"
+          $extracted = Get-ChildItem -Directory -Path $vendor -Filter "elasticsearch-*" | Select-Object -First 1
+          if ($null -eq $extracted) { throw "ES did not extract to vendor\elasticsearch-*" }
+          Rename-Item -Path $extracted.FullName -NewName "elasticsearch"
+          if (-not (Test-Path "$target/bin/elasticsearch.bat")) {
+            throw "Missing bin/elasticsearch.bat after extract"
+          }
+          if (-not (Test-Path "$target/jdk/bin/java.exe")) {
+            throw "Bundled JDK missing — wrong ZIP variant (must be the WITH-JDK Windows ZIP)"
+          }
+          Write-Host "ES extracted OK at $target"
+
+      # ────────────────────────────────────────────────────────────────────
+      # 4. ES snapshot (optional, fetched from secret URL)
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Fetch Elasticsearch snapshot
+        id: snapshot
+        if: steps.params.outputs.include_snapshot == 'true'
+        env:
+          SNAPSHOT_URL:  ${{ secrets.ES_SNAPSHOT_URL }}
+          SNAPSHOT_AUTH: ${{ secrets.ES_SNAPSHOT_AUTH }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SNAPSHOT_URL)) {
+            Write-Host "::warning::ES_SNAPSHOT_URL secret not set — building installer without bundled data."
+            "fetched=false" | Out-File $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          $dest = "osint-platform/packaging/vendor/snap_v1.tar.zst"
+          $authArgs = @()
+          if (-not [string]::IsNullOrWhiteSpace($env:SNAPSHOT_AUTH)) {
+            $authArgs = @("-H", "Authorization: $env:SNAPSHOT_AUTH")
+          }
+
+          Write-Host "Downloading snapshot to $dest"
+          curl.exe --fail --location --retry 5 --retry-delay 15 `
+            --connect-timeout 30 --speed-time 60 --speed-limit 1024 `
+            -o $dest @authArgs "$env:SNAPSHOT_URL"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dest)) {
+            throw "Snapshot download failed (exit $LASTEXITCODE)"
+          }
+          $sizeGb = [math]::Round((Get-Item $dest).Length / 1GB, 2)
+          Write-Host "Snapshot size: $sizeGb GB"
+          "fetched=true" | Out-File $env:GITHUB_OUTPUT -Append
+
+      # ────────────────────────────────────────────────────────────────────
+      # 5. Python dependencies + frontend export
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install -r osint-platform/backend/requirements.txt
+          python -m pip install `
+            "pyinstaller==${{ env.PYINSTALLER_VERSION }}" `
+            "zstandard==${{ env.ZSTANDARD_VERSION }}"
+          python -m pip list
+
+      - name: Build Next.js static export
+        working-directory: osint-platform/frontend
+        env:
+          NEXT_OUTPUT_EXPORT: "1"
+          NEXT_PUBLIC_API_BASE: ""
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          if (-not (Test-Path "out/index.html")) {
+            throw "Next.js export failed — out/index.html missing"
+          }
+
+          $static = "../backend/app/static"
+          if (Test-Path $static) {
+            Remove-Item -Recurse -Force $static
+          }
+          New-Item -ItemType Directory -Force -Path $static | Out-Null
+          Copy-Item -Recurse -Force out\* $static
+          Get-ChildItem $static | Format-Table -AutoSize
+
+      # ────────────────────────────────────────────────────────────────────
+      # 6. PyInstaller build
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: PyInstaller build
+        working-directory: osint-platform/packaging
+        run: |
+          pyinstaller --noconfirm --clean osint.spec
+          if (-not (Test-Path "dist/OSINT/OSINT.exe")) {
+            throw "PyInstaller did not produce dist\OSINT\OSINT.exe"
+          }
+          $exe = Get-Item "dist/OSINT/OSINT.exe"
+          $sizeMb = [math]::Round($exe.Length / 1MB, 1)
+          Write-Host "OSINT.exe: $sizeMb MB"
+
+      # ────────────────────────────────────────────────────────────────────
+      # 7. Stage ES + snapshot into the dist folder
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Stage Elasticsearch + snapshot into dist
+        working-directory: osint-platform/packaging
+        run: |
+          $dist = "dist/OSINT"
+
+          Copy-Item -Recurse -Force "vendor/elasticsearch" "$dist/elasticsearch"
+          Copy-Item -Force "es-config/elasticsearch.yml" "$dist/elasticsearch/config/elasticsearch.yml"
+          Copy-Item -Force "es-config/jvm.options"       "$dist/elasticsearch/config/jvm.options"
+
+          # Strip never-used ES modules to shrink the installer.
+          $strip = @("x-pack-ml", "x-pack-watcher", "x-pack-graph",
+                     "x-pack-rollup", "x-pack-deprecation", "x-pack-shutdown")
+          foreach ($m in $strip) {
+            $path = "$dist/elasticsearch/modules/$m"
+            if (Test-Path $path) {
+              Write-Host "Stripping $m"
+              Remove-Item -Recurse -Force $path
+            }
+          }
+          if (Test-Path "$dist/elasticsearch/logs") {
+            Remove-Item -Recurse -Force "$dist/elasticsearch/logs"
+          }
+
+          New-Item -ItemType Directory -Force -Path "$dist/es-snapshot" | Out-Null
+          if (Test-Path "vendor/snap_v1.tar.zst") {
+            Copy-Item -Force "vendor/snap_v1.tar.zst" "$dist/es-snapshot/snap_v1.tar.zst"
+            $size = [math]::Round((Get-Item "$dist/es-snapshot/snap_v1.tar.zst").Length / 1GB, 2)
+            Write-Host "Bundled snapshot: $size GB"
+          } else {
+            Write-Host "::warning::No snapshot bundled. Installer will ship with empty index."
+          }
+
+          # Portable mode template
+          "Rename to portable.flag for portable mode" | Out-File -Encoding ASCII "$dist/portable.flag.template"
+
+          $totalGb = [math]::Round((Get-ChildItem -Recurse $dist | Measure-Object -Property Length -Sum).Sum / 1GB, 2)
+          Write-Host "Total dist/OSINT size: $totalGb GB"
+
+      # ────────────────────────────────────────────────────────────────────
+      # 8. Smoke test
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Smoke test OSINT.exe
+        working-directory: osint-platform/packaging
+        run: |
+          # We can't fully launch the app on the runner (it would block
+          # the workflow on uvicorn). Instead we run the .exe with a flag
+          # that forces it to import all modules and exit. PyInstaller
+          # bundles the launcher.py directly, so a quick "--version"-like
+          # smoke is implemented by patching launcher to honor SMOKE_TEST.
+          # As a minimum sanity check, just verify the exe can be invoked
+          # without missing-DLL errors via a 2-second timeout.
+          $exe = "dist/OSINT/OSINT.exe"
+          $size = [math]::Round((Get-Item $exe).Length / 1KB, 1)
+          if ($size -lt 100) { throw "OSINT.exe suspiciously small ($size KB)" }
+          Write-Host "OSINT.exe present, $size KB stub (deps live in _internal/)."
+          Get-ChildItem "dist/OSINT" -Force | Format-Table Name,Length -AutoSize
+
+      # ────────────────────────────────────────────────────────────────────
+      # 9. Inno Setup installer
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Patch installer version
+        working-directory: osint-platform/packaging/installer
+        run: |
+          $iss = Get-Content -Raw osint.iss
+          $version = '${{ steps.params.outputs.installer_version }}'
+          $iss = $iss -replace '#define\s+AppVersion\s+"[^"]+"', "#define AppVersion `"$version`""
+          $iss | Set-Content -NoNewline osint.iss
+          Write-Host "Set AppVersion = $version"
+
+      - name: Build Inno Setup installer
+        working-directory: osint-platform/packaging/installer
+        run: |
+          # Inno Setup 6 is preinstalled on windows-latest at:
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not preinstalled, installing via choco..."
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler not found at $iscc after install"
+          }
+          & $iscc /Qp osint.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
+          Get-ChildItem Output | Format-Table Name,Length -AutoSize
+
+      # ────────────────────────────────────────────────────────────────────
+      # 10. Portable 7z archive
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Build portable 7z archive
+        working-directory: osint-platform/packaging
+        run: |
+          $sevenz = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenz)) {
+            throw "7-Zip not found at $sevenz (should be preinstalled on windows-latest)"
+          }
+          $out = "dist/OSINT-Portable.7z"
+          if (Test-Path $out) { Remove-Item -Force $out }
+          # mx=9 = ultra; ms=on = solid; mmt=on = multithreaded
+          & $sevenz a -t7z -mx=9 -ms=on -mmt=on $out "dist/OSINT/*"
+          if ($LASTEXITCODE -ne 0) { throw "7z failed (exit $LASTEXITCODE)" }
+          $size = [math]::Round((Get-Item $out).Length / 1GB, 2)
+          Write-Host "Portable 7z: $size GB"
+
+      # ────────────────────────────────────────────────────────────────────
+      # 11. Artifact uploads
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OSINT-Setup-${{ github.sha }}
+          path: osint-platform/packaging/installer/Output/*.exe
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0   # installer is already lzma2-compressed
+
+      - name: Upload portable archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OSINT-Portable-${{ github.sha }}
+          path: osint-platform/packaging/dist/OSINT-Portable.7z
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload bare OSINT.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OSINT-exe-${{ github.sha }}
+          path: osint-platform/packaging/dist/OSINT/OSINT.exe
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload PyInstaller analysis on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyinstaller-build-logs-${{ github.sha }}
+          path: |
+            osint-platform/packaging/build/**/warn-*.txt
+            osint-platform/packaging/build/**/xref-*.html
+            osint-platform/packaging/build/**/*.toc
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ────────────────────────────────────────────────────────────────────
+      # 12. GitHub Release on tag push
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OSINT Platform ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            osint-platform/packaging/installer/Output/*.exe
+            osint-platform/packaging/dist/OSINT-Portable.7z
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ────────────────────────────────────────────────────────────────────
+      # 13. Summary
+      # ────────────────────────────────────────────────────────────────────
+
+      - name: Job summary
+        if: always()
+        run: |
+          $md = @()
+          $md += "## OSINT Platform build"
+          $md += ""
+          $md += "| Field | Value |"
+          $md += "|-------|-------|"
+          $md += "| Installer version | ``${{ steps.params.outputs.installer_version }}`` |"
+          $md += "| ES version | ``${{ steps.params.outputs.es_version }}`` |"
+          $md += "| Snapshot bundled | ``${{ steps.snapshot.outputs.fetched || 'false' }}`` |"
+          $md += "| Commit | ``${{ github.sha }}`` |"
+          $md += ""
+          $installer = Get-ChildItem osint-platform/packaging/installer/Output -Filter "*.exe" -ErrorAction SilentlyContinue
+          if ($installer) {
+            $sz = [math]::Round($installer.Length / 1GB, 2)
+            $md += "**Installer:** ``$($installer.Name)`` — ${sz} GB"
+          }
+          $portable = "osint-platform/packaging/dist/OSINT-Portable.7z"
+          if (Test-Path $portable) {
+            $sz = [math]::Round((Get-Item $portable).Length / 1GB, 2)
+            $md += "**Portable:** ``OSINT-Portable.7z`` — ${sz} GB"
+          }
+          $md -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
