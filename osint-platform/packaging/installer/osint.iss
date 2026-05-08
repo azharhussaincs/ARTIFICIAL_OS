@@ -35,7 +35,9 @@ ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 WizardStyle=modern
+#if FileExists(AddBackslash(SourcePath) + "..\assets\osint.ico")
 SetupIconFile=..\assets\osint.ico
+#endif
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 CloseApplications=yes
